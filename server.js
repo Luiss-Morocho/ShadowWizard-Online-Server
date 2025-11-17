@@ -1,79 +1,135 @@
-const express = require("express");
-const http = require("http");
-const WebSocket = require("ws");
+// server.js
+// Servidor WebSocket para Shadow Wizard con TOP global persistente
+
+const express = require('express');
+const http = require('http');
+const WebSocket = require('ws');
+const fs = require('fs');
+const path = require('path');
+
+const PORT = process.env.PORT || 10000;
+const SCORES_FILE = path.join(__dirname, 'scores.json');
+
+// ================================
+// PERSISTENCIA: cargar / guardar
+// ================================
+
+let globalScores = [];
+
+function loadScores() {
+    try {
+        if (fs.existsSync(SCORES_FILE)) {
+            const raw = fs.readFileSync(SCORES_FILE, 'utf8');
+            globalScores = JSON.parse(raw);
+            console.log(`✅ Puntajes cargados desde ${SCORES_FILE} (${globalScores.length} registros).`);
+        } else {
+            console.log('ℹ️ No existe scores.json, se iniciará con TOP vacío.');
+        }
+    } catch (err) {
+        console.error('❌ Error leyendo scores.json:', err);
+        globalScores = [];
+    }
+}
+
+function saveScores() {
+    try {
+        fs.writeFileSync(SCORES_FILE, JSON.stringify(globalScores, null, 2), 'utf8');
+        console.log('💾 Puntajes guardados en scores.json');
+    } catch (err) {
+        console.error('❌ Error escribiendo scores.json:', err);
+    }
+}
+
+// Actualiza el TOP 10 con un nuevo resultado
+function updateGlobalScores(msg) {
+    const entry = {
+        player: msg.player || 'Jugador',
+        level: msg.level || '?',
+        stars: (msg.stars != null) ? msg.stars : 0,
+        score: (msg.score != null) ? msg.score : 0,
+        time: (msg.time != null) ? msg.time : 0,
+        timestamp: msg.timestamp || Date.now()
+    };
+
+    globalScores.push(entry);
+    globalScores.sort((a, b) => (b.score || 0) - (a.score || 0));
+    globalScores = globalScores.slice(0, 10);
+
+    saveScores();
+}
+
+// ================================
+// HTTP + WebSocket
+// ================================
 
 const app = express();
 
-app.get("/", (req, res) => {
-    res.send("Shadow Wizard WebSocket server is running.");
+// Endpoint simple para verificar que el server corre
+app.get('/', (req, res) => {
+    res.send('Shadow Wizard WebSocket server running.');
 });
 
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-// 🔹 AQUÍ guardamos el ranking global en memoria del servidor
-let globalScores = [];
+// Cargar puntajes al iniciar
+loadScores();
 
-wss.on("connection", (ws) => {
-    console.log("Cliente conectado.");
+wss.on('connection', (ws) => {
+    console.log('Cliente conectado.');
 
-    // 🔹 Cuando alguien se conecta, le envío el snapshot actual
-    ws.send(JSON.stringify({
-        type: "scores_snapshot",
-        scores: globalScores
-    }));
+    // Al conectar → mandar snapshot actual del TOP
+    if (globalScores.length > 0) {
+        ws.send(JSON.stringify({
+            type: 'scores_snapshot',
+            scores: globalScores
+        }));
+    }
 
-    ws.on("message", (data) => {
-        console.log("Mensaje recibido:", data.toString());
+    ws.on('message', (data) => {
+        const text = data.toString();
+        console.log('Mensaje recibido:', text);
 
-        let parsed;
+        let msg;
         try {
-            parsed = JSON.parse(data.toString());
-        } catch (e) {
-            console.error("Mensaje no válido:", data.toString());
+            msg = JSON.parse(text);
+        } catch (err) {
+            console.error('No se pudo parsear JSON:', err);
             return;
         }
 
-        // Si es un resultado de nivel
-        if (parsed.type === "level_complete") {
-            // Guardar en el ranking global
-            globalScores.push(parsed);
-            globalScores.sort((a, b) => (b.score || 0) - (a.score || 0));
-            globalScores = globalScores.slice(0, 20); // top 20 en servidor
+        // Solo nos interesa level_complete
+        if (msg.type === 'level_complete') {
+            // 1) Actualizar TOP global y guardar en archivo
+            updateGlobalScores(msg);
 
-            // 🔹 Broadcast del score individual (para el feed)
-            broadcast({
-                type: "level_complete",
-                ...parsed
+            // 2) Reenviar este mensaje a todos (para el ONLINE FEED)
+            wss.clients.forEach((client) => {
+                if (client.readyState === WebSocket.OPEN) {
+                    client.send(JSON.stringify(msg));
+                }
             });
 
-            // 🔹 Broadcast del snapshot actualizado (para el ranking)
-            broadcast({
-                type: "scores_snapshot",
+            // Nuevo snapshot a todos
+            
+            const snapshot = JSON.stringify({
+                type: 'scores_snapshot',
                 scores: globalScores
             });
-
-        } else {
-            // Otros tipos de mensajes, solo rebotar si quisieras
-            broadcast(parsed);
+            wss.clients.forEach((client) => {
+                if (client.readyState === WebSocket.OPEN) {
+                    client.send(snapshot);
+                }
+            });
+            
         }
     });
 
-    ws.on("close", () => {
-        console.log("Cliente desconectado.");
+    ws.on('close', () => {
+        console.log('Cliente desconectado.');
     });
 });
 
-function broadcast(obj) {
-    const str = JSON.stringify(obj);
-    for (const client of wss.clients) {
-        if (client.readyState === WebSocket.OPEN) {
-            client.send(str);
-        }
-    }
-}
-
-const PORT = process.env.PORT || 10000;
 server.listen(PORT, () => {
-    console.log(`Servidor escuchando en puerto ${PORT}`);
+    console.log(`Servidor WebSocket escuchando en puerto ${PORT}`);
 });
